@@ -1,0 +1,552 @@
+/*  
+ * Copyright (c) Eric Tsai 2017
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ *
+ * Credit:  I started with the basic BLE_Observer code from mbed Bluetooth Low Energy team
+ * https://developer.mbed.org/teams/Bluetooth-Low-Energy/code/BLE_Observer/file/88f50499af9a/main.cpp
+ *
+ *
+ *
+ * This BLE advertisement observer looks for specific advertisements from intended bacons
+ * and outputs beacon data as json over serial.  Compiled and tested for nRF51822 on mbed.
+*/
+
+#include "mbed.h"   //revision 148
+#include "ble/BLE.h"
+#include "mbedtls/aes.h"    //derived from the standard mbedtls.  Modified for smaller build.  See project.
+
+
+#define MyDebugEnb 0    //change to 1 for debug out of the same serial as intended output
+
+
+Ticker     ticker;
+
+//clock periodicity used for spoof checking, should be 1800 seconds for 30minutes
+//make sure matches periodicity of beacons for correct operation
+const uint16_t Periodicity = 1800;   
+
+//aes
+uint8_t src_buf[16] = {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4};
+uint8_t des_buf[16] = {0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4,0x1,0x2,0x3,0x4};
+mbedtls_aes_context aes;
+unsigned char iv[16] = {0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x1, 0x2, 0x3, 0x4, 0x5, 0x6, 0x7, 0x1, 0x2};       //16-byte aes key
+
+//Serial device(p9, p11);  //nRF51822 uart:  TX=p9.  RX=p11
+Serial device(p9, p11);  //nRF51822 uart:  TX=p9.  RX=p11
+DigitalIn pinHandShake(p0);  //handshake uart to prevent output before bridge MCU is ready.  Flow control.
+
+//data structures for tracking wake time of BLE end nodes, for to prevent spoofing
+struct MAC_Birth_Record
+{
+    uint8_t MAC_Addr[6]; //mac[0] is low order byte in mac address
+    uint16_t MAC_Time;  //The time of birth for this end node
+    uint16_t Attempt_MAC_Time;
+    uint8_t Attempt_Cnt;
+    uint8_t Xmit_Cnt;
+};
+const uint8_t sizeOfSpoof = 50; //translates to the number of unique BLE modules this gateway should receive
+MAC_Birth_Record Spoof_Check[sizeOfSpoof];   //array tracking end node birth times
+uint8_t Spoof_Ray_Tail = 0;         //array index for next record
+uint8_t Received_MAC_Addr[6]; //mac[0] is low order byte in mac address
+uint16_t Received_MAC_Time;     //global var to hold MAC for processing the current ADV
+static Timer Gateway_Time;  //global for the # seconds within each "Periodicity" cycle, each 30 minute chunk.
+static uint16_t Expected_MAC_Time;  //holds Gateway Time Zone value for  Beacon's birth time indicated by ADV
+uint8_t Received_Xmit_Cnt;  //global var to hold xmit count for processing the current ADV
+const uint8_t Allowance = 5;  //number of seconds allowed for MAC Birthtime mismatch
+
+// possible return values for Is_Not_Spoofed()
+const uint8_t ADVisUnknown = 0;     //Unaccounted for advertisement type, should never happen
+const uint8_t ADVisNew = 1;             //first time seeing this MAC address
+const uint8_t ADVisDuplicate = 2;       //packet is one of the duplicate advertisement
+const uint8_t ADVisSpoof = 3;           //birth times do not match
+
+uint8_t MAC_gateway[6] = {0x0,0x0,0x0,0x0,0x0,0x0};  //mac address of this gateway BLE module
+
+//********************
+// Checks if Beacon's transmitted MAC birth time matches and gateway's recorded MAC birth time.
+// Takes into account 30-minute clock, takes care of edge cases for wrap around
+// returns:
+//      TRUE:  if sensor's reported time lines up to gateway's recorded time
+//********************
+bool Is_Birth_Time_Correct (uint16_t gateway_mac_time, uint16_t sensor_mac_time, uint8_t margin)
+{
+    bool return_val = 0;
+    uint16_t current_time = (uint16_t)(Gateway_Time.read_ms()/1000);
+    int16_t gateway_time_zone = current_time - sensor_mac_time;
+    
+    if (current_time >= sensor_mac_time)        //simple time translation
+    {
+        Expected_MAC_Time = current_time - sensor_mac_time;
+    }
+    else        //wrap around time given periodicity
+    {
+        Expected_MAC_Time = (Periodicity - sensor_mac_time + current_time);
+    }
+    
+    //todo:  perhaps return true if count is 0 to avoid 3-transmits needed to confirm devices that were reset?  Meh.
+    if (1) 
+    {
+        //We can't be too stringent that beacon MAC time precisely matches recorded time, because we're advertising 
+        // the same data over several seconds.  Not bothering to update the MAC time of each ADV within same event.
+        // Pick margin time (in seconds) based on how many seconds the beacon is advertising, to give this alloweance
+        // For example, you want to be more certain that beacon seen by gateway, and you increase the number of seconds
+        // you advertise for from 2 to 4 seconds.  Then Margin has to be likewise increased to 4 seconds.
+        // Increasing probably that Beacon is seen results in slightly compromised spoof-detection.
+        if ( (gateway_mac_time < (Expected_MAC_Time + margin)) && (gateway_mac_time > (Expected_MAC_Time - margin)) )
+        {
+            return_val = 1;
+        }
+        else
+        {
+            return_val = 0;
+            
+        }  
+    }
+
+    return return_val;
+}//end Is_Birth_Time_Correct
+
+
+
+/* ****************************************
+iterates Beacon adv against all mac birth records to detect spoofing, repeats, and
+add device to birth records if new
+
+returns
+    ADVisNew = 1                First time seeing this MAC address
+    ADVisDuplicate = 2         Subsequent advertisements for same event
+    ADVisSpoof = 3              MAC times do not match
+    ADVisUnknown = 0        Shouldn't encounter this, debug
+*******************************************/
+uint8_t Is_Not_Spoofed ()
+{
+    uint8_t return_val = ADVisUnknown;
+    
+    //iterate through all of birth records looking for one that matches MAC address
+    for (int i=0; i<sizeOfSpoof; i++)
+    {
+        //Search for matching MAC address
+        if (Spoof_Check[i].MAC_Addr[0] == Received_MAC_Addr[0] &&
+            Spoof_Check[i].MAC_Addr[1] == Received_MAC_Addr[1] &&
+            Spoof_Check[i].MAC_Addr[2] == Received_MAC_Addr[2] &&
+            Spoof_Check[i].MAC_Addr[3] == Received_MAC_Addr[3] &&
+            Spoof_Check[i].MAC_Addr[4] == Received_MAC_Addr[4] &&
+            Spoof_Check[i].MAC_Addr[5] == Received_MAC_Addr[5])
+        {
+            #if MyDebugEnb
+            device.printf("found MAC address in array\r\n");
+            device.printf("   Index = %d \r\n", i);
+            device.printf("   MAC = %02x:%02x:%02x:%02x:%02x:%02x \r\n", Received_MAC_Addr[5],Received_MAC_Addr[4],Received_MAC_Addr[3],Received_MAC_Addr[2],Received_MAC_Addr[1],Received_MAC_Addr[0]);
+            device.printf("   Received MAC Time =  %d \r\n", Received_MAC_Time);
+            device.printf("   Gateway time = %d \r\n", (uint16_t)(Gateway_Time.read_ms()/1000));
+            device.printf("   Array.MAC_Time =  %d \r\n", Spoof_Check[i].MAC_Time);
+            device.printf("   Array.Attempt_MAC_Time =  %d \r\n", Spoof_Check[i].Attempt_MAC_Time);
+            device.printf("   Array.Attempt_Cnt =  %d \r\n", Spoof_Check[i].Attempt_Cnt);
+            device.printf("   Array.Xmit_Cnt =  %d \r\n", Spoof_Check[i].Xmit_Cnt);
+            device.printf("   expected time =  %d \r\n", ((uint16_t)(Gateway_Time.read_ms()/1000)) - Received_MAC_Time);
+            #endif
+            
+            if 
+            (
+                //check primary MAC time
+                //adjust margin=5 as needed to accomodate Beacon advertisement interval time
+                // if advertising for 3 seconds, then make margin 4.  4->5, etc...
+                Is_Birth_Time_Correct(Spoof_Check[i].MAC_Time, Received_MAC_Time, Allowance)
+            )
+            {
+                if (Spoof_Check[i].Xmit_Cnt != Received_Xmit_Cnt)   //check if this is duplicate
+                {
+                    return_val = ADVisNew; //MAC Time checks out and not duplicate
+                    Spoof_Check[i].MAC_Time = Expected_MAC_Time;    //update birth time for this device.
+                    Spoof_Check[i].Xmit_Cnt = Received_Xmit_Cnt;
+                    //i = sizeOfSpoof;    //exit for loop, we've found the MAC address.  But can't do it this way.
+                    //ToDo:  hey, what happens if the array holds entries w/ same MAC?  Is that possible?
+                    #if MyDebugEnb
+                    device.printf("Pirmary MAC Time as expected...expected=%d...Spoof_mac_tmr=%d \r\n", Expected_MAC_Time, Spoof_Check[i].MAC_Time);
+                    #endif
+                }
+                else
+                {
+                    return_val = ADVisDuplicate; //MAC Time checks out and is duplicate
+                }
+            }//if primary MAC_time match
+            else
+            {
+                
+                // check secondary Mac_Time
+                // allows for device to become registered if secondary matches multiple times
+                #if MyDebugEnb
+                device.printf("    MAC Time No Match!!...expected=%d...Spoof_mac_tmr=%d \r\n", Expected_MAC_Time, Spoof_Check[i].MAC_Time);
+                #endif 
+                
+                //increment count if matches secondary
+                if (Is_Birth_Time_Correct(Spoof_Check[i].Attempt_MAC_Time, Received_MAC_Time, Allowance))
+                {
+                    if (Spoof_Check[i].Xmit_Cnt != Received_Xmit_Cnt)   //not a duplicate ADV
+                    {
+                        Spoof_Check[i].Attempt_Cnt++;
+                        Spoof_Check[i].Xmit_Cnt = Received_Xmit_Cnt;
+                        #if MyDebugEnb
+                        device.printf("    Match on secondary, Attempt_Cnt= %d, Attempt_MAC_Time = %d, Expected_MAC_Time=%d \r\n", Spoof_Check[i].Attempt_Cnt, Spoof_Check[i].Attempt_MAC_Time, Expected_MAC_Time);
+                        #endif
+                        //this takes care of usecase where a module is reset after it's already been seen by gateway
+                        //after 3 consecutive correlated MAC_Time attempts we assume is our long lost friend and not a spoof.
+                        if (Spoof_Check[i].Attempt_Cnt >= 3)
+                        {
+                            return_val = ADVisNew;
+                            
+                            //promote this MAC_Time to primary and start accepting data @ this MAC_Time
+                            Spoof_Check[i].MAC_Time = Expected_MAC_Time;
+                            Spoof_Check[i].Xmit_Cnt = Received_Xmit_Cnt;
+                            Spoof_Check[i].Attempt_Cnt = 0;
+                        }
+                        else    //Received_MAC_Time matches Attempt, but not enough times to be considered as valid.
+                        {
+                            return_val = ADVisSpoof;
+                        }
+                    }//is not duplicate, and transmit count matches
+                    else
+                    {
+                        #if MyDebugEnb
+                        device.printf("    is Duplicate , but matches Attempt_MAC_Time matches\r\n");
+                        #endif 
+                        return_val = ADVisDuplicate;
+                    }
+                } //Recevied MAC_Time matches secondary MAC_Time
+                else
+                {
+                    #if MyDebugEnb
+                    device.printf("    No Match on secondary either, ===setting return_val = Spoof ===\r\n");
+                    #endif 
+                    return_val = ADVisSpoof;  //it should still be zero, so this is just for clarification
+                    //at this point:  MAC matches, MAC_Time doesn't match primary nor secondary.
+                    Spoof_Check[i].Attempt_Cnt = 0;  //reset secondary count
+                }
+                //update second backup regardless whether it matches exptected_mac_time matches secondary or not.
+                Spoof_Check[i].Attempt_MAC_Time = Expected_MAC_Time;
+                Spoof_Check[i].Xmit_Cnt = Received_Xmit_Cnt;
+            }//if Primary MAC_Time doesn't match
+            
+            break;  //return_val tells us if this is a valid or not.  Don't need to search through remainder of array
+        }//if matching MAC address
+        else //MAC doesn't match
+        {
+            //MAC doesn't match and we've searched through entire record
+            //let's add this MAC as new, and initialze records to match this sensor
+            if (i >= (sizeOfSpoof - 1))   //we've searched through entire array and didn't find this MAC
+            {
+                //we've searched through the entire array and didn't find this MAC address
+                //add this MAC to array, and report this as valid MAC_Time
+                #if MyDebugEnb
+                device.printf("MAC not found, creating new at %d \r\n", Spoof_Ray_Tail);
+                device.printf("  sizeOfSpoof=%d ... and i=%d \r\n", sizeOfSpoof, i);  
+                #endif
+                
+                return_val = ADVisNew;
+
+                //create new entry for newly seen MAC @ tail of FIFO
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[0] = Received_MAC_Addr[0];
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[1] = Received_MAC_Addr[1];
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[2] = Received_MAC_Addr[2];
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[3] = Received_MAC_Addr[3];
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[4] = Received_MAC_Addr[4];
+                Spoof_Check[Spoof_Ray_Tail].MAC_Addr[5] = Received_MAC_Addr[5];
+                Spoof_Check[Spoof_Ray_Tail].Xmit_Cnt = Received_Xmit_Cnt;
+
+                //call this just to calculate Expected_MAC_Time...kinda ugly to do this.  todo:  don't do this
+                Is_Birth_Time_Correct (0, Received_MAC_Time, Allowance);
+                #if MyDebugEnb
+                device.printf("Expected_MAC_Time should be %d \r\n", Expected_MAC_Time);
+                #endif
+                Spoof_Check[Spoof_Ray_Tail].MAC_Time = Expected_MAC_Time;    //wrong!!!
+                Spoof_Check[Spoof_Ray_Tail].Xmit_Cnt = Received_Xmit_Cnt;
+                Spoof_Check[Spoof_Ray_Tail].Attempt_Cnt = 0;
+                
+                //increment tail pointer to next position or wrap around
+                if (Spoof_Ray_Tail >= (sizeOfSpoof-1) ) //FIFO at end of array, return to beginning
+                {
+                    Spoof_Ray_Tail = 0;
+                }
+                else
+                {
+                    Spoof_Ray_Tail++;
+                }
+                
+            }//end if loop at end of array
+        }//end else not maching MAC
+    }//loop through Spoof_Check array
+
+ 
+    return return_val;
+}//end Is_Not_Spoofed()
+
+
+void periodicCallback(void) //every Periodicity seconds, reset clock
+{
+#if MyDebugEnb
+    device.printf("===== reset timer ===== \r\n");
+#endif
+    Gateway_Time.reset();
+}
+
+
+
+//Scheme for recognizing our beacons and ignoring all other beacons
+//idea:  could use something like Pearson hash on parts of MAC address to make less obvious
+bool is_ours(const uint8_t * adv_data, const uint8_t * adv_address)
+{
+    if ((adv_data[5] == adv_address[3]) && (adv_data[6] == adv_address[2]))
+        return 1;
+    else
+        return 0;
+}
+
+
+// callback when BLE stack scans and finds a BLE ADV packet
+// Parse ADV and determine if it's one of ours, output data to serial if it is.
+void advertisementCallback(const Gap::AdvertisementCallbackParams_t *params) {
+
+    if ( (params->advertisingDataLen) >= 8)
+    {
+        if (is_ours(params->advertisingData, params->peerAddr))
+        {
+            #if MyDebugEnb
+            device.printf("----------- ADV CAll Back -----------------\r\n  ");
+            #endif 
+            
+            //**************
+            // Decrypt data
+            //**************
+            //prep array for deciphering the encrypted portion of advertisement
+            for (int i = 0; i<16; i++)
+            {
+                src_buf[i]=params->advertisingData[i+15];
+                #if MyDebugEnb
+                //device.printf("%x ", src_buf[i]);
+                #endif
+            }
+            mbedtls_aes_crypt_ecb( &aes, MBEDTLS_AES_DECRYPT, src_buf, des_buf );   //execution time not an issue
+            #if MyDebugEnb
+            //device.printf("decoded first 16 bytes \r\n");
+            for (int i = 0; i<16; i++)
+            {
+                //device.printf("%02x", params->advertisingData[index]);
+                if (i < 2)
+                {
+                   //device.printf("%x ", des_buf[i]); 
+                }
+                else
+                {
+                    //device.printf("%c ", des_buf[i]);
+                }
+            }
+            //device.printf("done----- \r\n");
+            #endif
+            
+            //save MAC address to global
+            Received_MAC_Addr[0] = params->peerAddr[0];
+            Received_MAC_Addr[1] = params->peerAddr[1];
+            Received_MAC_Addr[2] = params->peerAddr[2];
+            Received_MAC_Addr[3] = params->peerAddr[3];
+            Received_MAC_Addr[4] = params->peerAddr[4];
+            Received_MAC_Addr[5] = params->peerAddr[5];
+            
+            Received_MAC_Time = des_buf[0] | (des_buf[1] << 8);  //it's a 2 byte uint little endian
+            Received_Xmit_Cnt = des_buf[2];
+            
+            
+            
+            
+            // punch out the data over serial as json 
+            //---------------------------------------
+            // 1.  MAC and RSSI
+            // "mac":xxxxxxxx,rssi:xx,
+            //---------------------------------------
+            uint8_t ADV_Result = Is_Not_Spoofed();
+            #if MyDebugEnb
+            device.printf("--------ADV_Result = %d", ADV_Result);
+            #endif
+
+            //decide wether or not duplicate ADV packets should be output as well.
+            //if ((ADV_Result == ADVisNew) || (ADV_Result==ADVisDuplicate))  //output both first and duplicates
+            if (ADV_Result == ADVisNew)  //only output first received ADV
+            {
+                device.printf("{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"rssi\":%d,",
+                    params->peerAddr[5], 
+                    params->peerAddr[4], 
+                    params->peerAddr[3], 
+                    params->peerAddr[2], 
+                    params->peerAddr[1], 
+                    params->peerAddr[0],
+                    params->rssi
+                    );
+    
+                //---------------------------------------
+                // 2.  Volt is always X.XX, per Beacon code
+                // "volt":3.03,
+                //---------------------------------------
+                device.printf("\"volt\":%c%c%c%c,",
+                    params->advertisingData[9],
+                    params->advertisingData[10],
+                    params->advertisingData[11],
+                    params->advertisingData[12]);
+                
+    
+                //---------------------------------------
+                // 3.  Beacon time (# seconds since birth, clocked around Periodicity) 0-1800 seconds
+                // "tmr":xxxx,
+                //---------------------------------------
+                
+                device.printf("\"tmr\":%d,", Received_MAC_Time);
+                
+                //---------------------------------------
+                // 4.  Xmit Counter 0-255, incremented by Beacon with each new unique ADV event.
+                // "tmr":xxxx,
+                //---------------------------------------                
+                device.printf("\"xmit_cnt\":%d,", Received_Xmit_Cnt);
+                
+                //---------------------------------------
+                // 5.  rest of sensor payload as json
+                // "tmr":xxx,
+                //---------------------------------------
+                for (int i = 3; i<16; i++)
+                {
+                    device.printf("%c", des_buf[i]);    //print as character
+                    //Note that sensor JSON payload most likely is not exactly 16 bytes long, so there's likely /0 in middle
+                    // of this.  But JSON library on gateway handles this gracefully.
+                }
+    
+                device.printf("}");
+                device.printf("\r\n");  //gateway looking for cariage return to indicate end
+                wait_ms(60);  //needed to give gateway time to assert flow control handshake pin
+                while (pinHandShake.read() == 1)    //normally pulled down, so loop when gateway processing;
+                {
+                    //uart flow control
+                    //blocking until gateway has processed ADV data from uart
+                }
+            }
+
+            if (ADV_Result == ADVisSpoof)  //If detected spoofed sensor data
+            {
+                device.printf("{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"spoof\": %d}\r\n",
+                    params->peerAddr[5], 
+                    params->peerAddr[4], 
+                    params->peerAddr[3], 
+                    params->peerAddr[2], 
+                    params->peerAddr[1], 
+                    params->peerAddr[0],
+                    ADV_Result);
+            }
+            
+            if (ADV_Result == ADVisUnknown)  //catch all, should never occur
+            {
+                device.printf("{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"unknown\": %d}\r\n",
+                    params->peerAddr[5], 
+                    params->peerAddr[4], 
+                    params->peerAddr[3], 
+                    params->peerAddr[2], 
+                    params->peerAddr[1], 
+                    params->peerAddr[0],
+                    ADV_Result);            
+            }
+        }//end if it's our adv
+    }//end if advertisingDataLen
+}//end advertisementCallback
+
+
+
+/**
+ * This function is called when the ble initialization process has failed
+ */
+void onBleInitError(BLE &ble, ble_error_t error)
+{
+    /* Initialization error handling should go here */
+    device.printf("periodic callback ");
+    device.printf("\r\n");
+}
+
+/**
+ * Callback triggered when the ble initialization process has finished
+ */
+void bleInitComplete(BLE::InitializationCompleteCallbackContext *params)
+{
+    BLE&        ble   = params->ble;
+    ble_error_t error = params->error;
+
+    if (error != BLE_ERROR_NONE) {
+        /* In case of error, forward the error handling to onBleInitError */
+        onBleInitError(ble, error);
+        return;
+    }
+
+    /* Ensure that it is the default instance of BLE */
+    if(ble.getInstanceID() != BLE::DEFAULT_INSTANCE) {
+        return;
+    }
+ 
+    //note:  defaults to scanning 3 channels.
+    // Window and Interval in ms.  Duty cycle = (interval / window);  200ms/500ms = 40%;  Max is 10000
+    //  |---window---|                          |---window---|                       |---window---|
+    //  |---------- interval @ ch1 -----| |------- interval @ ch2--------||-----interval @ ch3-------|
+    //  set window equal to interval for full duty cycle scanning
+    //  set interval to hit all 3 channels of beacon advertising over advertising time duration
+    ble.gap().setScanParams(500 /* scan interval */, 500 /* scan window */);
+    ble.gap().startScan(advertisementCallback);
+}
+
+int main(void)
+{
+    pinHandShake.mode(PullDown); //Expecting gateway to set pin high for flow control
+    
+    //intialize spoof checking data structure
+    for (int i=0; i<sizeOfSpoof; i++)
+    {
+        Spoof_Check[i].MAC_Addr[0]= 0;
+        Spoof_Check[i].MAC_Addr[1]= 0;
+        Spoof_Check[i].MAC_Addr[2]= 0;
+        Spoof_Check[i].MAC_Time = 0;
+        Spoof_Check[i].Attempt_MAC_Time = 0;
+        Spoof_Check[i].Attempt_Cnt = 0;
+        Spoof_Check[i].Attempt_Cnt = 0;
+        Spoof_Check[i].Xmit_Cnt = 0;
+    }
+        
+    //maintains periodicity for spoof checking scheme
+    Gateway_Time.start();
+    ticker.attach(periodicCallback, Periodicity);
+    
+    device.baud(9600);  //p0.9 tx, p0.11 rx.  Use p0.9 to gateway
+
+    mbedtls_aes_setkey_dec( &aes, iv, 128 );  //set AES key for decrypt
+
+    BLE &ble = BLE::Instance();
+    ble.init(bleInitComplete);
+    
+    ble.getAddress(0,MAC_gateway);  //get this gateway module's ble MAC
+    device.printf("{\"mac\":\"%02x%02x%02x%02x%02x%02x\",\"gatewaystart\":\"now\"},",
+        MAC_gateway[5], 
+        MAC_gateway[4], 
+        MAC_gateway[3], 
+        MAC_gateway[2], 
+        MAC_gateway[1], 
+        MAC_gateway[0]
+        );
+    device.printf("\r\n");
+    
+    while (true) 
+    {
+        ble.waitForEvent();  //idle here until callback
+    }
+}
