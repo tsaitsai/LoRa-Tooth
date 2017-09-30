@@ -70,6 +70,10 @@ int heartbeat_cnt=0;
 //"**CHANGE**" debug output
 #define MyDebug 0  //0=no debug, 1=deeebug
 
+//"**CHANGE**" BLE, LORA, etc...
+#define RF_TYPE BLE
+//#define RF_TYPE LORA
+
 //buffer for char[] used in mqtt publishes, size at least as big as topic + msg length
 char mqtt_buf[60];   // e.g "/ble/esp1/d76dcd1b3720/volt" is 30 chars long
 
@@ -212,9 +216,9 @@ void localParseJson(char *mybuf)
   
     //construct the first part of the topic name, which is just /BLE or /LORA
     mytopic[0]='/'; topic_char_index++;
-    mytopic[1]='b'; topic_char_index++;
-    mytopic[2]='l'; topic_char_index++;
-    mytopic[3]='e'; topic_char_index++;
+    mytopic[1]='y'; topic_char_index++;
+    mytopic[2]='y'; topic_char_index++;
+    mytopic[3]='y'; topic_char_index++;
     mytopic[4]='/'; topic_char_index++;  //topic_char_index is 5;
 
     //add gateway location name, /ble/LIVINGROOM
@@ -394,5 +398,4 @@ void loop() {
     mqttclient.publish(mqtt_name,itoa(heartbeat_cnt, mqtt_buf, 10));
   } //end heartbeat
 } //end loop
-
 
