@@ -254,9 +254,9 @@ void localParseJson(char *mybuf)
   
     //construct the first part of the topic name, which is just /ble/mac
     mytopic[0]='/'; topic_char_index++;
-    mytopic[1]='b'; topic_char_index++;
-    mytopic[2]='l'; topic_char_index++;
-    mytopic[3]='e'; topic_char_index++;
+    mytopic[1]='y'; topic_char_index++;
+    mytopic[2]='y'; topic_char_index++;
+    mytopic[3]='y'; topic_char_index++;
     mytopic[4]='/'; topic_char_index++;  //topic_char_index is 5;
 
     //add gateway location name, /ble/LIVINGROOM
